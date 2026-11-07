@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
@@ -9,10 +10,11 @@ import { AuditService } from '../audit/audit.service';
 import { CreateDonationDto } from './dto/create-donation.dto';
 import { Decimal } from '@prisma/client/runtime/library';
 import { CampaignStatus, DonationStatus } from '@prisma/client';
-import { MercadoPagoConfig, Preference } from 'mercadopago';
+import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 
 @Injectable()
 export class DonationsService {
+  private readonly logger = new Logger(DonationsService.name);
   private mpClient: MercadoPagoConfig | null = null;
 
   constructor(
@@ -69,11 +71,14 @@ export class DonationsService {
       },
     });
 
-    // Crear preferencia de Mercado Pago
     if (!this.mpClient) {
-      // Modo desarrollo sin MP configurado
+      this.logger.warn('Mercado Pago no configurado — donación en PENDING');
       return {
-        donation,
+        donation: {
+          id: donation.id,
+          netAmount: net,
+          grossAmount: gross,
+        },
         checkoutUrl: null,
         message: 'Mercado Pago no configurado. Donación creada en estado PENDING.',
       };
@@ -81,26 +86,29 @@ export class DonationsService {
 
     const preference = new Preference(this.mpClient);
     const frontendUrl = this.config.get<string>('FRONTEND_URL', 'http://localhost:3000');
+    const apiUrl = this.config.get<string>('API_URL', 'http://localhost:3001');
 
     const pref = await preference.create({
       body: {
         items: [
           {
             id: donation.id,
-            title: `Donación - ${campaign.title}`,
+            title: `Donación - ${campaign.title}`.
+              slice(0, 100),
             quantity: 1,
             unit_price: Number(gross),
             currency_id: 'ARS',
           },
         ],
         external_reference: donation.id,
-        notification_url: `${this.config.get('API_URL') || 'http://localhost:3001'}/api/donations/webhook`,
+        notification_url: `${apiUrl}/api/donations/webhook`,
         back_urls: {
           success: `${frontendUrl}/donacion/exito?id=${donation.id}`,
           failure: `${frontendUrl}/donacion/error?id=${donation.id}`,
           pending: `${frontendUrl}/donacion/pendiente?id=${donation.id}`,
         },
         auto_return: 'approved',
+        statement_descriptor: 'AYUDA SOLIDARIA',
       },
     });
 
@@ -110,22 +118,84 @@ export class DonationsService {
     });
 
     return {
-      donation: { id: donation.id, netAmount: net },
+      donation: { id: donation.id, netAmount: net, grossAmount: gross },
       checkoutUrl: pref.init_point,
+      sandboxUrl: pref.sandbox_init_point,
       preferenceId: pref.id,
     };
   }
 
-  async handleWebhook(body: any) {
-    // Procesar notificación de Mercado Pago
-    // En producción validar firma con MERCADOPAGO_WEBHOOK_SECRET
-    const externalRef = body?.data?.id || body?.external_reference;
+  /**
+   * Webhook de Mercado Pago.
+   * Tipos relevantes: payment
+   */
+  async handleWebhook(body: any, query?: any) {
+    this.logger.log(`Webhook recibido: ${JSON.stringify({ body, query })}`);
 
-    if (!externalRef) return { received: true };
+    // MP puede enviar topic/id por query o por body
+    const topic = query?.topic || query?.type || body?.type || body?.action;
+    const paymentId =
+      query?.id ||
+      query?.['data.id'] ||
+      body?.data?.id ||
+      body?.id;
 
-    // Aquí se consulta el pago a MP y se actualiza el estado
-    // Simplificado para el esqueleto:
-    return { received: true };
+    if (!paymentId) {
+      return { received: true, processed: false, reason: 'no payment id' };
+    }
+
+    // Solo nos interesan notificaciones de payment
+    if (topic && !String(topic).includes('payment')) {
+      return { received: true, processed: false, reason: `ignored topic: ${topic}` };
+    }
+
+    if (!this.mpClient) {
+      this.logger.warn('MP no configurado, no se puede consultar el pago');
+      return { received: true, processed: false, reason: 'mp not configured' };
+    }
+
+    try {
+      const paymentApi = new Payment(this.mpClient);
+      const payment = await paymentApi.get({ id: paymentId });
+
+      const externalRef = payment.external_reference;
+      if (!externalRef) {
+        return { received: true, processed: false, reason: 'no external_reference' };
+      }
+
+      const status = payment.status; // approved | pending | rejected | cancelled | refunded
+
+      if (status === 'approved') {
+        await this.markAsPaid(externalRef, {
+          paymentId: payment.id,
+          status: payment.status,
+          statusDetail: payment.status_detail,
+          transactionAmount: payment.transaction_amount,
+          dateApproved: payment.date_approved,
+          paymentMethodId: payment.payment_method_id,
+        });
+        return { received: true, processed: true, status: 'approved' };
+      }
+
+      if (status === 'rejected' || status === 'cancelled') {
+        await this.prisma.donation.updateMany({
+          where: {
+            id: externalRef,
+            status: DonationStatus.PENDING,
+          },
+          data: {
+            status: DonationStatus.REJECTED,
+            mercadopagoData: payment as any,
+          },
+        });
+        return { received: true, processed: true, status };
+      }
+
+      return { received: true, processed: false, status };
+    } catch (err: any) {
+      this.logger.error(`Error procesando webhook: ${err.message}`, err.stack);
+      return { received: true, processed: false, error: err.message };
+    }
   }
 
   async markAsPaid(donationId: string, mpData?: any) {
@@ -134,8 +204,13 @@ export class DonationsService {
       include: { campaign: true },
     });
 
-    if (!donation || donation.status === DonationStatus.APPROVED) {
-      return donation;
+    if (!donation) {
+      this.logger.warn(`Donación ${donationId} no encontrada`);
+      return null;
+    }
+
+    if (donation.status === DonationStatus.APPROVED) {
+      return donation; // idempotente
     }
 
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -164,9 +239,14 @@ export class DonationsService {
       action: 'DONATION_PAID',
       entityType: 'Donation',
       entityId: donationId,
-      metadata: { amount: donation.grossAmount, net: donation.netAmount },
+      metadata: {
+        amount: Number(donation.grossAmount),
+        net: Number(donation.netAmount),
+        campaignId: donation.campaignId,
+      },
     });
 
+    this.logger.log(`Donación ${donationId} marcada como pagada. Neto: ${donation.netAmount}`);
     return updated;
   }
 
@@ -199,5 +279,16 @@ export class DonationsService {
     ]);
 
     return { items, meta: { total, page, limit } };
+  }
+
+  async findOne(id: string) {
+    const donation = await this.prisma.donation.findUnique({
+      where: { id },
+      include: {
+        campaign: { select: { id: true, title: true, slug: true } },
+      },
+    });
+    if (!donation) throw new NotFoundException('Donación no encontrada');
+    return donation;
   }
 }

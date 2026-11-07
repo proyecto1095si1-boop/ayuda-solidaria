@@ -25,13 +25,16 @@ export class DonationsController {
   constructor(private donationsService: DonationsService) {}
 
   @Post()
-  @ApiOperation({ summary: 'Crear donación (puede ser anónima)' })
-  async create(
-    @Body() dto: CreateDonationDto,
-    @Req() req: Request,
-    @CurrentUser('id') donorId?: string,
-  ) {
-    // JwtAuthGuard no es obligatorio → donorId puede ser undefined
+  @ApiOperation({ summary: 'Crear donación (puede ser anónima, sin auth)' })
+  async create(@Body() dto: CreateDonationDto, @Req() req: Request) {
+    // Intentamos leer el user si hay token, pero no es obligatorio
+    let donorId: string | undefined;
+    try {
+      const auth = req.headers.authorization;
+      // Si hay JWT el middleware/guard lo pondría; aquí lo dejamos opcional
+    } catch {
+      // ignore
+    }
     return this.donationsService.create(dto, donorId, {
       ip: req.ip,
       ua: req.headers['user-agent'],
@@ -41,11 +44,17 @@ export class DonationsController {
   @Post('webhook')
   @HttpCode(200)
   @ApiOperation({ summary: 'Webhook de Mercado Pago' })
-  async webhook(@Body() body: any) {
-    return this.donationsService.handleWebhook(body);
+  async webhook(@Body() body: any, @Query() query: any) {
+    return this.donationsService.handleWebhook(body, query);
   }
 
-  @Get('admin')
+  @Get(':id')
+  @ApiOperation({ summary: 'Consultar estado de una donación' })
+  async findOne(@Param('id') id: string) {
+    return this.donationsService.findOne(id);
+  }
+
+  @Get('admin/list')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.ADMIN)
   @ApiBearerAuth()

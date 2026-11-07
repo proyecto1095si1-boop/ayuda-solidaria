@@ -2,14 +2,16 @@ import {
   Controller,
   Get,
   Patch,
-  Post,
   Body,
   Param,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
-import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import { ApiTags, ApiBearerAuth, ApiOperation, ApiQuery } from '@nestjs/swagger';
+import { Response } from 'express';
 import { AdminService } from './admin.service';
+import { ExportsService } from './exports.service';
 import { CampaignsService } from '../campaigns/campaigns.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -26,6 +28,7 @@ export class AdminController {
   constructor(
     private adminService: AdminService,
     private campaignsService: CampaignsService,
+    private exportsService: ExportsService,
   ) {}
 
   @Get('dashboard')
@@ -72,5 +75,44 @@ export class AdminController {
     @CurrentUser('id') adminId: string,
   ) {
     return this.campaignsService.toggleFeatured(id, adminId);
+  }
+
+  // ─── Exportaciones ───────────────────────────────────────────
+
+  @Get('exports/donations')
+  @ApiOperation({ summary: 'Exportar donaciones (CSV o Excel)' })
+  @ApiQuery({ name: 'format', enum: ['csv', 'excel'], required: false })
+  async exportDonations(
+    @Query('format') format: 'csv' | 'excel' = 'csv',
+    @Res() res: Response,
+  ) {
+    if (format === 'excel') {
+      const buffer = await this.exportsService.exportDonationsExcel();
+      res.set({
+        'Content-Type':
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="donaciones-${Date.now()}.xlsx"`,
+      });
+      return res.send(buffer);
+    }
+
+    const csv = await this.exportsService.exportDonationsCsv();
+    res.set({
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="donaciones-${Date.now()}.csv"`,
+    });
+    // BOM para que Excel abra bien los acentos
+    return res.send('\uFEFF' + csv);
+  }
+
+  @Get('exports/transfers')
+  @ApiOperation({ summary: 'Exportar transferencias (CSV)' })
+  async exportTransfers(@Res() res: Response) {
+    const csv = await this.exportsService.exportTransfersReport();
+    res.set({
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="transferencias-${Date.now()}.csv"`,
+    });
+    return res.send('\uFEFF' + csv);
   }
 }
